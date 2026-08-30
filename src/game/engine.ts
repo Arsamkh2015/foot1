@@ -15,6 +15,7 @@ export interface UiSnapshot {
   scoreH: number;
   scoreA: number;
   timeLeft: number;
+  countdown: number;
   minute: number;
   possH: number;
   shotsH: number;
@@ -105,6 +106,9 @@ interface Ply {
   chase: boolean;
   lungeT: number;
   holdT: number;
+  skillT: number;
+  skillCd: number;
+  runPhase: number;
 }
 
 interface Ring {
@@ -155,8 +159,9 @@ export class MatchEngine {
   private onUi: (s: UiSnapshot) => void;
 
   private players: Ply[] = [];
-  private ball = { pos: v(W / 2, H / 2), vel: v(0, 0), spin: 0 };
+  private ball = { pos: v(W / 2, H / 2), vel: v(0, 0), spin: 0, z: 0, vz: 0 };
   private owner: Ply | null = null;
+  private moveTouch: Vec = v(0, 0);
 
   phase: Phase = "kickoff";
   paused = false;
@@ -256,6 +261,9 @@ export class MatchEngine {
           chase: false,
           lungeT: 0,
           holdT: 0,
+          skillT: 0,
+          skillCd: 0,
+          runPhase: Math.random() * 6,
         });
       });
     });
@@ -303,10 +311,14 @@ export class MatchEngine {
       p.kickCd = 0;
       p.lungeT = 0;
       p.holdT = 0;
+      p.skillT = 0;
+      p.skillCd = 0;
       p.chase = false;
     });
     this.ball.pos = v(W / 2, H / 2);
     this.ball.vel = v(0, 0);
+    this.ball.z = 0;
+    this.ball.vz = 0;
     this.owner = null;
     this.phase = "kickoff";
     this.countdown = 1.5;
@@ -348,9 +360,36 @@ export class MatchEngine {
     } else if (c === "KeyX" || c === "KeyJ") {
       if (me && this.owner === me) this.humanPass(me);
       else if (me) me.lungeT = 0.28;
+    } else if (c === "KeyC" || c === "KeyL") {
+      if (me && this.owner === me) this.humanCross(me);
+    } else if (c === "KeyZ" || c === "KeyI") {
+      if (me) this.humanDribble(me);
     } else if (c === "KeyQ" || c === "KeyE") {
       this.manualSwitch(c === "KeyE" ? 1 : -1);
     }
+  }
+
+  /** Public input for touch buttons. */
+  action(name: "shoot" | "pass" | "cross" | "dribble") {
+    if (this.cfg.demo || this.paused || this.phase !== "play") return;
+    const me = this.controlled;
+    if (!me) return;
+    if (name === "shoot") {
+      if (this.owner === me) this.humanShoot(me);
+      else me.lungeT = 0.28;
+    } else if (name === "pass") {
+      if (this.owner === me) this.humanPass(me);
+      else me.lungeT = 0.28;
+    } else if (name === "cross") {
+      if (this.owner === me) this.humanCross(me);
+    } else if (name === "dribble") {
+      this.humanDribble(me);
+    }
+  }
+
+  /** Public input for the touch joystick (-1..1 axes). */
+  setMove(x: number, y: number) {
+    this.moveTouch = v(clamp(x, -1, 1), clamp(y, -1, 1));
   }
 
   setPaused(p: boolean) {
@@ -374,18 +413,22 @@ export class MatchEngine {
 
   // ------------------------------------------------------------ actions
 
-  private kick(p: Ply, target: Vec, power: number, kind: "pass" | "shoot" | "punt") {
+  private kick(p: Ply, target: Vec, power: number, kind: "pass" | "shoot" | "punt" | "cross") {
     const d = norm(v(target.x - this.ball.pos.x, target.y - this.ball.pos.y));
     this.ball.vel = v(d.x * power + p.vel.x * 0.25, d.y * power + p.vel.y * 0.25);
     p.kickCd = 0.42;
     if (this.owner === p) this.owner = null;
+    if (kind === "cross") {
+      this.ball.z = 0.25;
+      this.ball.vz = 6.5 + power * 0.16;
+    }
     this.rings.push({
       x: this.ball.pos.x,
       y: this.ball.pos.y,
       r: 0.4,
       max: kind === "shoot" ? 3.4 : 2.4,
       life: 1,
-      color: kind === "shoot" ? "#00E5FF" : "#ffffff",
+      color: kind === "shoot" ? "#00E5FF" : kind === "cross" ? "#6C3BFF" : "#ffffff",
     });
     if (kind === "shoot") {
       if (p.team === 0) this.stats.shotsH++;
@@ -394,6 +437,8 @@ export class MatchEngine {
       sfx.play("kick");
     } else if (kind === "punt") {
       sfx.play("kick");
+    } else if (kind === "cross") {
+      sfx.play("cross");
     } else {
       sfx.play("pass");
     }
@@ -433,6 +478,46 @@ export class MatchEngine {
       this.kick(p, lead, clamp(11 + d * 0.85, 13, 26), "pass");
     } else {
       this.kick(p, v(p.pos.x + aim.x * 12, p.pos.y + aim.y * 12), 12, "pass");
+    }
+  }
+
+  /** Lofted cross / long diagonal ball into the attacking zone. */
+  private humanCross(p: Ply) {
+    const attackX = W;
+    // prefer an advanced wide or central teammate in the final third
+    let best: Ply | null = null;
+    let bestS = -Infinity;
+    for (const m of this.players) {
+      if (m.team !== 0 || m === p || m.role === "GK") continue;
+      if (m.pos.x < W * 0.45) continue;
+      const s = m.pos.x * 1.1 - dist(p.pos, m.pos) * 0.25 + Math.random() * 4;
+      if (s > bestS) {
+        bestS = s;
+        best = m;
+      }
+    }
+    const target = best
+      ? v(best.pos.x + best.vel.x * 0.5, best.pos.y + best.vel.y * 0.5)
+      : v(attackX - 8, p.pos.y > H / 2 ? H / 2 + 6 : H / 2 - 6);
+    const d = dist(p.pos, target);
+    this.kick(p, target, clamp(13 + d * 0.62, 15, 24), "cross");
+  }
+
+  /** Close-control burst: brief speed boost + steal immunity. */
+  private humanDribble(p: Ply) {
+    if (p.skillCd > 0) return;
+    p.skillT = 0.45;
+    p.skillCd = 1.0;
+    sfx.play("skill");
+    this.rings.push({ x: p.pos.x, y: p.pos.y, r: 0.6, max: 2.6, life: 1, color: "#00E5FF" });
+    if (this.owner === p) {
+      const f = Math.hypot(p.vel.x, p.vel.y) > 0.5 ? norm(p.vel) : p.facing;
+      this.ball.vel = v(f.x * 9 + p.vel.x, f.y * 9 + p.vel.y);
+      this.owner = null;
+      p.kickCd = 0.18; // re-collect almost instantly
+      this.autoSwitchT = Math.max(this.autoSwitchT, 0.5);
+      // keep the ball with the runner
+      this.controlled = p;
     }
   }
 
@@ -476,6 +561,21 @@ export class MatchEngine {
       if (p.decideT <= 0) {
         p.decideT = preset.react * (0.7 + Math.random() * 0.7);
         const dGoal = dist(p.pos, oppGoal);
+
+        // lofted cross from wide, advanced areas
+        const wide = p.pos.y < 15 || p.pos.y > H - 15;
+        const advanced = p.team === 0 ? p.pos.x > W * 0.6 : p.pos.x < W * 0.4;
+        if (wide && advanced && Math.random() < 0.42) {
+          const mates = this.players.filter(
+            (m) => m.team === p.team && (m.role === "FW" || m.role === "MF") && m !== p
+          );
+          const box = mates.sort((a, b2) => dist(a.pos, oppGoal) - dist(b2.pos, oppGoal))[0];
+          const t = box ? v(box.pos.x, box.pos.y) : v(p.team === 0 ? W - 12 : 12, H / 2);
+          const dd2 = dist(p.pos, t);
+          this.kick(p, t, clamp(13 + dd2 * 0.62, 15, 24), "cross");
+          return;
+        }
+
         const shootChance = dGoal < 16 ? 0.75 : dGoal < 26 ? 0.34 : 0.08;
         if (dGoal < 30 && Math.random() < shootChance) {
           const err =
@@ -672,9 +772,11 @@ export class MatchEngine {
       if (k.has("KeyD") || k.has("ArrowRight")) ix += 1;
       if (k.has("KeyW") || k.has("ArrowUp")) iy -= 1;
       if (k.has("KeyS") || k.has("ArrowDown")) iy += 1;
-      const moving = ix !== 0 || iy !== 0;
+      ix += this.moveTouch.x;
+      iy += this.moveTouch.y;
+      const moving = Math.hypot(ix, iy) > 0.18;
       const sprint = k.has("ShiftLeft") || k.has("ShiftRight");
-      const sp = sprint ? 8.7 : 6.7;
+      const sp = (sprint ? 8.7 : 6.7) * (1 + p.skillT * 1.1);
       const want = moving ? norm(v(ix, iy)) : v(0, 0);
       if (moving) this.lastDir = want;
       p.vel = v(
@@ -688,6 +790,9 @@ export class MatchEngine {
     for (const p of this.players) {
       p.kickCd = Math.max(0, p.kickCd - dt);
       p.lungeT = Math.max(0, p.lungeT - dt);
+      p.skillT = Math.max(0, p.skillT - dt);
+      p.skillCd = Math.max(0, p.skillCd - dt);
+      p.runPhase += Math.hypot(p.vel.x, p.vel.y) * dt * 2.6;
       if (p.role === "GK") {
         this.updateGK(p, dt);
         continue;
@@ -762,6 +867,8 @@ export class MatchEngine {
       const f = Math.hypot(o.vel.x, o.vel.y) > 0.6 ? norm(o.vel) : o.facing;
       b.pos = v(o.pos.x + f.x * 0.95, o.pos.y + f.y * 0.95);
       b.vel = v(o.vel.x, o.vel.y);
+      b.z = 0;
+      b.vz = 0;
       b.spin += Math.hypot(o.vel.x, o.vel.y) * dt * 0.3;
       return;
     }
@@ -784,6 +891,17 @@ export class MatchEngine {
       sp = 34;
     }
     b.spin += sp * dt * 0.35;
+
+    // altitude (lofted crosses)
+    if (b.z > 0 || b.vz > 0) {
+      b.vz -= 26 * dt;
+      b.z += b.vz * dt;
+      if (b.z <= 0) {
+        b.z = 0;
+        if (b.vz < -2.5) sfx.play("bounce");
+        b.vz = Math.abs(b.vz) > 1.4 ? -b.vz * 0.4 : 0;
+      }
+    }
 
     const inMouth = Math.abs(b.pos.y - H / 2) < GOAL_HALF - 0.15;
 
@@ -812,7 +930,7 @@ export class MatchEngine {
     };
 
     if (b.pos.x < BALL_R) {
-      if (inMouth) {
+      if (inMouth && b.z < 2.2) {
         if (b.pos.x < -NET + 0.35) {
           b.pos.x = -NET + 0.35;
           b.vel.x *= -0.15;
@@ -835,7 +953,7 @@ export class MatchEngine {
         }
       }
     } else if (b.pos.x > W - BALL_R) {
-      if (inMouth) {
+      if (inMouth && b.z < 2.2) {
         if (b.pos.x > W + NET - 0.35) {
           b.pos.x = W + NET - 0.35;
           b.vel.x *= -0.15;
@@ -869,8 +987,8 @@ export class MatchEngine {
       const o = this.owner;
       if (dist(o.pos, b.pos) > 2.1) {
         this.owner = null;
-      } else if (o.kickCd <= 0) {
-        // steal attempts
+      } else if (o.kickCd <= 0 && o.skillT <= 0) {
+        // steal attempts (skill-move burst is briefly protected)
         const diff = DIFFS[this.cfg.demo ? "pro" : this.cfg.difficulty];
         for (const q of this.players) {
           if (q.team === o.team || q.kickCd > 0) continue;
@@ -898,10 +1016,9 @@ export class MatchEngine {
 
     if (!this.owner) {
       // keepers react at any ball speed
-      for (const p of this.players) {
-        if (p.role !== "GK" || p.kickCd > 0) continue;
-        const d = dist(p.pos, b.pos);
-        if (d < 1.75) {
+        for (const p of this.players) {
+          if (p.role !== "GK" || p.kickCd > 0 || b.z > 1.9) continue;
+          const d = dist(p.pos, b.pos);        if (d < 1.75) {
           if (bsp < 10.5) {
             this.owner = p;
             p.holdT = 0.9 + Math.random() * 0.6;
@@ -926,7 +1043,7 @@ export class MatchEngine {
       }
     }
 
-    if (!this.owner && bsp < 17) {
+    if (!this.owner && bsp < 17 && b.z < 0.5) {
       let best: Ply | null = null;
       let bd = 2.0;
       for (const p of this.players) {
@@ -1004,6 +1121,7 @@ export class MatchEngine {
       scoreH: this.scoreH,
       scoreA: this.scoreA,
       timeLeft: Math.max(0, this.cfg.durationSec - this.elapsed),
+      countdown: this.phase === "kickoff" ? this.countdown : 0,
       minute: clamp(Math.round((this.elapsed / this.cfg.durationSec) * 90), 0, 90),
       possH: poss > 0 ? this.stats.possH / poss : 0.5,
       shotsH: this.stats.shotsH,
@@ -1064,6 +1182,18 @@ export class MatchEngine {
 
     ctx.setTransform(s, 0, 0, s, ox, oy);
 
+    // stadium tier bands (outer → inner), pitch drawn over the middle
+    ctx.fillStyle = "#060b1e";
+    ctx.fillRect(-MX, -MY, W + 2 * MX, H + 2 * MY);
+    ctx.fillStyle = "#0a1330";
+    ctx.fillRect(-5.0, -4.7, W + 10, H + 9.4);
+    ctx.fillStyle = "#0d1738";
+    ctx.fillRect(-2.7, -2.5, W + 5.4, H + 5);
+    ctx.strokeStyle = "rgba(0,168,255,0.12)";
+    ctx.lineWidth = 0.08;
+    ctx.strokeRect(-2.7, -2.5, W + 5.4, H + 5);
+    ctx.strokeRect(-5.0, -4.7, W + 10, H + 9.4);
+
     // crowd
     for (const d of this.crowd) {
       const al = clamp(d.base + Math.sin(t * d.sp + d.ph) * d.amp, 0.05, 0.75);
@@ -1088,13 +1218,58 @@ export class MatchEngine {
     }
     ctx.globalAlpha = 1;
 
-    // LED boards
-    ctx.fillStyle = "#0a1128";
-    ctx.fillRect(-1, -1.5, W + 2, 0.8);
-    ctx.fillRect(-1, H + 0.7, W + 2, 0.8);
-    ctx.fillStyle = "rgba(0,229,255,0.5)";
-    ctx.fillRect(-1, -1.5, W + 2, 0.09);
-    ctx.fillRect(-1, H + 1.41, W + 2, 0.09);
+    // floodlight towers
+    const goalBoost = this.phase === "goal" ? 0.16 : 0;
+    const towers: [number, number][] = [
+      [-MX + 1.6, -MY + 1.5],
+      [W + MX - 1.6, -MY + 1.5],
+      [-MX + 1.6, H + MY - 1.5],
+      [W + MX - 1.6, H + MY - 1.5],
+    ];
+    for (const [tx, ty] of towers) {
+      const g = ctx.createRadialGradient(tx, ty, 0.4, tx, ty, 6.5);
+      g.addColorStop(0, `rgba(190,235,255,${0.3 + goalBoost})`);
+      g.addColorStop(1, "rgba(190,235,255,0)");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(tx, ty, 6.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#101c42";
+      ctx.fillRect(tx - 0.85, ty - 0.6, 1.7, 1.2);
+      for (let lx = 0; lx < 3; lx++)
+        for (let ly = 0; ly < 2; ly++) {
+          ctx.fillStyle = "#dff4ff";
+          ctx.beginPath();
+          ctx.arc(tx - 0.5 + lx * 0.5, ty - 0.25 + ly * 0.5, 0.14, 0, Math.PI * 2);
+          ctx.fill();
+        }
+    }
+
+    // scrolling LED ad boards
+    const adText = "CLÁSSICO  ✦  ELITE FOOTBALL  ✦  SEASON 26  ✦  NIGHT CUP  ✦  LIVE  ✦  ";
+    ctx.font = `600 0.72px "Barlow Condensed", sans-serif`;
+    const cell = ctx.measureText(adText).width;
+    const scroll = (t * 3.4) % cell;
+    const board = (by: number) => {
+      ctx.fillStyle = "#050a1c";
+      ctx.fillRect(-1.2, by - 0.48, W + 2.4, 0.96);
+      ctx.fillStyle = "rgba(0,229,255,0.55)";
+      ctx.fillRect(-1.2, by - 0.48, W + 2.4, 0.06);
+      ctx.fillRect(-1.2, by + 0.42, W + 2.4, 0.06);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(-1.2, by - 0.48, W + 2.4, 0.96);
+      ctx.clip();
+      ctx.fillStyle = "rgba(0,229,255,0.82)";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      for (let x = -scroll - cell; x < W + 2; x += cell) {
+        ctx.fillText(adText, x, by + 0.04);
+      }
+      ctx.restore();
+    };
+    board(-1.05);
+    board(H + 1.05);
 
     this.drawPitch(ctx, t);
     this.drawGoals(ctx);
@@ -1134,6 +1309,17 @@ export class MatchEngine {
     }
     ctx.globalAlpha = 1;
 
+    // stadium light flash on goals
+    if (this.phase === "goal") {
+      const fl = clamp((this.celebrateT - 2.05) / 0.65, 0, 1);
+      if (fl > 0) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = `rgba(190,240,255,${0.26 * fl})`;
+        ctx.fillRect(0, 0, cv.width, cv.height);
+        ctx.setTransform(s, 0, 0, s, ox, oy);
+      }
+    }
+
     // vignette (screen space)
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     const vg = ctx.createRadialGradient(
@@ -1151,13 +1337,13 @@ export class MatchEngine {
   }
 
   private drawPitch(ctx: CanvasRenderingContext2D, t: number) {
-    // turf
-    ctx.fillStyle = "#0e5c33";
+    // turf — alternating mow stripes
+    ctx.fillStyle = "#0f6b3a";
     ctx.fillRect(0, 0, W, H);
     const stripes = 12;
+    ctx.fillStyle = "#0c5f33";
     for (let i = 0; i < stripes; i++) {
       if (i % 2 === 0) continue;
-      ctx.fillStyle = "rgba(255,255,255,0.033)";
       ctx.fillRect((i * W) / stripes, 0, W / stripes, H);
     }
     // floodlight pools
@@ -1264,10 +1450,21 @@ export class MatchEngine {
     const trim = def.secondary;
     const controlled = !this.cfg.demo && p === this.controlled;
 
-    // shadow
-    ctx.fillStyle = "rgba(0,0,0,0.34)";
+    // celebration / dejection poses during the goal break
+    const celebrating = this.phase === "goal" && p.team === this.scorerTeam;
+    const dejected = this.phase === "goal" && p.team !== this.scorerTeam;
+    const bounce = celebrating ? Math.abs(Math.sin(t * 9 + p.id * 1.7)) * 0.5 : 0;
+    const scale = dejected ? 0.93 : 1;
+    const dy = p.pos.y - bounce;
+    const speed = Math.hypot(p.vel.x, p.vel.y);
+    const ang = Math.atan2(p.facing.y, p.facing.x);
+    const px = -p.facing.y;
+    const py = p.facing.x;
+
+    // shadow (stays grounded, shrinks on bounce)
+    ctx.fillStyle = `rgba(0,0,0,${0.36 - bounce * 0.22})`;
     ctx.beginPath();
-    ctx.ellipse(p.pos.x + 0.12, p.pos.y + 0.34, 0.86, 0.5, 0, 0, Math.PI * 2);
+    ctx.ellipse(p.pos.x + 0.12, p.pos.y + 0.36, 0.86 * (1 - bounce * 0.2), 0.48, 0, 0, Math.PI * 2);
     ctx.fill();
 
     if (controlled) {
@@ -1279,15 +1476,25 @@ export class MatchEngine {
       ctx.arc(p.pos.x, p.pos.y, 1.22 + pulse * 0.16, 0, Math.PI * 2);
       ctx.stroke();
       ctx.globalAlpha = 1;
-      // chevron
       const bob = Math.sin(t * 7) * 0.16;
       ctx.fillStyle = "#00E5FF";
       ctx.beginPath();
-      ctx.moveTo(p.pos.x, p.pos.y - 1.55 + bob);
-      ctx.lineTo(p.pos.x - 0.55, p.pos.y - 2.25 + bob);
-      ctx.lineTo(p.pos.x + 0.55, p.pos.y - 2.25 + bob);
+      ctx.moveTo(p.pos.x, dy - 1.75 + bob);
+      ctx.lineTo(p.pos.x - 0.55, dy - 2.45 + bob);
+      ctx.lineTo(p.pos.x + 0.55, dy - 2.45 + bob);
       ctx.closePath();
       ctx.fill();
+    }
+
+    // skill burst flash
+    if (p.skillT > 0) {
+      ctx.globalAlpha = p.skillT * 1.8;
+      ctx.strokeStyle = "#00E5FF";
+      ctx.lineWidth = 0.14;
+      ctx.beginPath();
+      ctx.arc(p.pos.x, dy, 1.35, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
     }
 
     // lunge flash
@@ -1301,46 +1508,102 @@ export class MatchEngine {
       ctx.globalAlpha = 1;
     }
 
-    // body
+    ctx.save();
+    ctx.translate(p.pos.x, dy);
+    ctx.scale(scale, scale);
+
+    // feet — alternating step cycle while running, kick follow-through
+    const kicking = p.kickCd > 0.26;
+    const step = speed > 0.8 ? Math.sin(p.runPhase) * 0.34 : 0;
+    const bootCol = "#131a2e";
+    ctx.fillStyle = bootCol;
+    if (kicking) {
+      // striking foot extended forward
+      ctx.beginPath();
+      ctx.arc(p.facing.x * 1.12, p.facing.y * 1.12 - 0.06, 0.21, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(-px * 0.4 - p.facing.x * 0.15, -py * 0.4 - p.facing.y * 0.15, 0.19, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.beginPath();
+      ctx.arc(px * 0.42 + p.facing.x * step, py * 0.42 + p.facing.y * step, 0.19, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(-px * 0.42 - p.facing.x * step, -py * 0.42 - p.facing.y * step, 0.19, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // torso with kit stripes
+    ctx.save();
+    ctx.rotate(ang);
+    ctx.beginPath();
+    ctx.arc(0, 0, 0.92, 0, Math.PI * 2);
     ctx.fillStyle = body;
-    ctx.beginPath();
-    ctx.arc(p.pos.x, p.pos.y, 0.92, 0, Math.PI * 2);
     ctx.fill();
-    // sash / trim ring
-    ctx.strokeStyle = trim;
-    ctx.lineWidth = 0.3;
-    ctx.beginPath();
-    ctx.arc(p.pos.x, p.pos.y, 0.55, 0, Math.PI * 2);
-    ctx.stroke();
-    // facing notch
-    ctx.fillStyle = trim;
-    ctx.beginPath();
-    ctx.arc(p.pos.x + p.facing.x * 0.72, p.pos.y + p.facing.y * 0.72, 0.16, 0, Math.PI * 2);
-    ctx.fill();
+    if (!isGK) {
+      ctx.save();
+      ctx.clip();
+      ctx.fillStyle = trim;
+      ctx.fillRect(-0.62, -1, 0.3, 2);
+      ctx.fillRect(0.02, -1, 0.3, 2);
+      ctx.restore();
+    } else {
+      ctx.strokeStyle = trim;
+      ctx.lineWidth = 0.22;
+      ctx.beginPath();
+      ctx.arc(0, 0, 0.62, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+
     // outline
-    ctx.strokeStyle = "rgba(4,8,24,0.55)";
+    ctx.strokeStyle = "rgba(4,8,24,0.6)";
     ctx.lineWidth = 0.09;
     ctx.beginPath();
-    ctx.arc(p.pos.x, p.pos.y, 0.92, 0, Math.PI * 2);
+    ctx.arc(0, 0, 0.92, 0, Math.PI * 2);
     ctx.stroke();
 
-    // number
-    ctx.fillStyle = luminance(body) > 0.6 ? "#0a1226" : "#ffffff";
-    ctx.font = `700 0.78px "Barlow", sans-serif`;
+    // raised arms when celebrating
+    if (celebrating) {
+      ctx.fillStyle = body;
+      ctx.beginPath();
+      ctx.arc(px * 0.95, py * 0.95 - 0.55, 0.18, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(-px * 0.95, -py * 0.95 - 0.55, 0.18, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // head
+    ctx.fillStyle = luminance(body) > 0.55 ? "#23293d" : "#e3cdb4";
+    ctx.beginPath();
+    ctx.arc(p.facing.x * 0.3, p.facing.y * 0.3 - 0.1, 0.34, 0, Math.PI * 2);
+    ctx.fill();
+
+    // shirt number on the back
+    ctx.fillStyle = luminance(body) > 0.55 ? "#0a1226" : "#ffffff";
+    ctx.font = `700 0.66px "Barlow", sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(String(p.num), p.pos.x, p.pos.y + 0.05);
+    ctx.fillText(String(p.num), -p.facing.x * 0.3, -p.facing.y * 0.3 + 0.42);
+
+    ctx.restore();
   }
 
   private drawBall(ctx: CanvasRenderingContext2D) {
     const b = this.ball;
-    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    const lift = b.z * 0.78;
+    const r = BALL_R * (1 + b.z * 0.05);
+    // grounded shadow — detaches and fades as the ball climbs
+    ctx.fillStyle = `rgba(0,0,0,${0.35 / (1 + b.z * 0.55)})`;
     ctx.beginPath();
-    ctx.ellipse(b.pos.x + 0.1, b.pos.y + 0.3, 0.42, 0.24, 0, 0, Math.PI * 2);
+    ctx.ellipse(b.pos.x + 0.1, b.pos.y + 0.3, 0.42 / (1 + b.z * 0.18), 0.24, 0, 0, Math.PI * 2);
     ctx.fill();
+    const by = b.pos.y - lift;
     ctx.fillStyle = "#fdfdff";
     ctx.beginPath();
-    ctx.arc(b.pos.x, b.pos.y, BALL_R, 0, Math.PI * 2);
+    ctx.arc(b.pos.x, by, r, 0, Math.PI * 2);
     ctx.fill();
     ctx.strokeStyle = "rgba(10,18,38,0.5)";
     ctx.lineWidth = 0.06;
@@ -1349,7 +1612,7 @@ export class MatchEngine {
     for (let i = 0; i < 5; i++) {
       const a = b.spin + (i * Math.PI * 2) / 5;
       ctx.beginPath();
-      ctx.arc(b.pos.x + Math.cos(a) * 0.22, b.pos.y + Math.sin(a) * 0.22, 0.09, 0, Math.PI * 2);
+      ctx.arc(b.pos.x + Math.cos(a) * 0.22, by + Math.sin(a) * 0.22, 0.09, 0, Math.PI * 2);
       ctx.fill();
     }
   }

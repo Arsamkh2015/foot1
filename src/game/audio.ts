@@ -11,6 +11,8 @@ type SfxName =
   | "whistleFull"
   | "kick"
   | "pass"
+  | "cross"
+  | "skill"
   | "bounce"
   | "post"
   | "catch"
@@ -138,6 +140,14 @@ class AudioFX {
       case "pass":
         this.tone("sine", 170, 70, 0.09, 0.3);
         this.noise(0.06, 0.16, 1100, 1.6);
+        break;
+      case "cross":
+        this.tone("sine", 140, 55, 0.16, 0.4);
+        this.noise(0.14, 0.2, 1500, 1.2);
+        break;
+      case "skill":
+        this.tone("square", 500, 820, 0.07, 0.12);
+        this.tone("square", 820, 1180, 0.07, 0.1, 0.05);
         break;
       case "bounce":
         this.tone("sine", 130, 60, 0.07, 0.18);

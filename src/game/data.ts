@@ -44,7 +44,7 @@ export const TEAMS: TeamDef[] = [
     name: "Real Madrid",
     short: "RMA",
     primary: "#F5F7FF",
-    secondary: "#FEBE10",
+    secondary: "#FF5FA2",
     gk: "#2BD9A0",
     rating: 91,
     stars: [
